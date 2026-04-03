@@ -352,12 +352,11 @@ RE_IKEv2_LIFE   = re.compile(
 )
 
 # IKEv1 transform sets
+# Handles both:
+#   crypto ipsec ikev1 transform-set <name> <enc> <hash>
+#   crypto ipsec ikev1 transform-set <name> mode <transport|tunnel>
 RE_IKEv1_TS = re.compile(
-    r'^crypto ipsec ikev1 transform-set\s+(\S+)\s+(\S+)(?:\s+(\S+))?',
-    re.IGNORECASE
-)
-RE_TS_MODE = re.compile(
-    r'^crypto ipsec ikev1 transform-set\s+\S+.*\s+mode\s+(transport|tunnel)',
+    r'^crypto ipsec ikev1 transform-set\s+(\S+)\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?',
     re.IGNORECASE
 )
 
@@ -1133,29 +1132,90 @@ def parse_crypto(lines):
                 current_ikev2_policy['lifetime'] = m.group(1)
                 continue
 
-        # ── IKEv1 transform sets ──────────────────────────────
+       # ── IKEv1 transform sets ──────────────────────────────
         m = RE_IKEv1_TS.match(stripped)
         if m:
             reset_all()
-            name     = m.group(1)
-            esp_enc  = m.group(2).lower()
-            esp_hash = m.group(3).lower() if m.group(3) else None
+            name   = m.group(1)
+            token2 = m.group(2).lower() if m.group(2) else None
+            token3 = m.group(3).lower() if m.group(3) else None
+            token4 = m.group(4).lower() if m.group(4) else None
+            token5 = m.group(5).lower() if m.group(5) else None
 
-            mode = 'tunnel'
-            mode_m = RE_TS_MODE.match(stripped)
-            if mode_m:
-                mode = mode_m.group(1).lower()
-                if esp_hash and esp_hash in ('transport', 'tunnel', 'mode'):
-                    esp_hash = None
+            all_tokens = [t for t in [token2, token3, token4, token5]
+                          if t is not None]
 
-            ikev1_ts.append({
-                'name'    : name,
-                'esp_enc' : esp_enc,
-                'esp_hash': esp_hash,
-                'mode'    : mode,
-                'ftd_enc' : ftd_enc_status(esp_enc),
-                'ftd_hash': ftd_int_status(esp_hash) if esp_hash else 'N/A',
-            })
+            # Check if this is a mode-only line:
+            # crypto ipsec ikev1 transform-set <name> mode transport
+            if token2 == 'mode' and token3 in ('transport', 'tunnel', None):
+                # This is a mode continuation line for an existing TS
+                # Find and update the existing entry rather than creating new
+                for existing in ikev1_ts:
+                    if existing['name'] == name:
+                        existing['mode'] = token3 or 'tunnel'
+                        break
+                else:
+                    # Mode line appeared before main TS line — store for merge
+                    ikev1_ts.append({
+                        'name'    : name,
+                        'esp_enc' : '(mode-only line)',
+                        'esp_hash': None,
+                        'mode'    : token3 or 'tunnel',
+                        'ftd_enc' : 'UNKNOWN',
+                        'ftd_hash': 'N/A',
+                    })
+                continue
+
+            # Normal transform set line — extract enc and hash
+            # Tokens may include mode keyword inline at end
+            esp_enc  = None
+            esp_hash = None
+            mode     = 'tunnel'
+
+            # Walk tokens — first esp-* token is enc, second is hash
+            # 'mode' keyword followed by transport/tunnel sets mode
+            i = 0
+            while i < len(all_tokens):
+                tok = all_tokens[i]
+                if tok == 'mode' and i + 1 < len(all_tokens):
+                    mode = all_tokens[i + 1]
+                    i += 2
+                    continue
+                if tok in ('transport', 'tunnel') and i > 0 \
+                        and all_tokens[i-1] == 'mode':
+                    i += 1
+                    continue
+                if esp_enc is None:
+                    esp_enc = tok
+                elif esp_hash is None:
+                    esp_hash = tok
+                i += 1
+
+            if esp_enc is None:
+                esp_enc = '(none)'
+
+            # Check if an entry for this name already exists
+            # (mode continuation line processed first edge case)
+            existing_entry = next(
+                (ts for ts in ikev1_ts if ts['name'] == name), None
+            )
+            if existing_entry and existing_entry['esp_enc'] == '(mode-only line)':
+                # Update the placeholder
+                existing_entry['esp_enc']  = esp_enc
+                existing_entry['esp_hash'] = esp_hash
+                existing_entry['ftd_enc']  = ftd_enc_status(esp_enc)
+                existing_entry['ftd_hash'] = (
+                    ftd_int_status(esp_hash) if esp_hash else 'N/A'
+                )
+            else:
+                ikev1_ts.append({
+                    'name'    : name,
+                    'esp_enc' : esp_enc,
+                    'esp_hash': esp_hash,
+                    'mode'    : mode,
+                    'ftd_enc' : ftd_enc_status(esp_enc),
+                    'ftd_hash': ftd_int_status(esp_hash) if esp_hash else 'N/A',
+                })
             continue
 
         # ── IKEv2 proposal header ─────────────────────────────

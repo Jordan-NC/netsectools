@@ -185,6 +185,9 @@ FTD_IKE_HASH = {
     'sha-256': 'OK',
     'sha-384': 'OK',
     'sha-512': 'OK',
+    # Null — valid when used with AES-GCM encryption
+    'null'   : 'OK',
+    'none'   : 'OK',
 }
 
 # DH group FTD status

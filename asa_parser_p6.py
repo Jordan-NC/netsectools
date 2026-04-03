@@ -668,12 +668,12 @@ def _build_exec_findings(results, version_info):
     # VPN
     vpn_sessions = results['vpn_sessions']
     total_active = sum(s['active'] for s in vpn_sessions)
-    has_anyconnect = any(
-        'anyconnect' in s['session_type'].lower()
+   has_anyconnect = any(
+        'anyconnect' in s.get('label', s.get('session_type', '')).lower()
         for s in vpn_sessions
     )
     has_s2s = any(
-        'site-to-site' in s['session_type'].lower()
+        'site-to-site' in s.get('label', s.get('session_type', '')).lower()
         for s in vpn_sessions
     )
 

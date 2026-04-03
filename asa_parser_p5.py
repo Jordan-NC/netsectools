@@ -30,6 +30,9 @@
 #   Also parses:
 #     - object network blocks (host, subnet, range, description)
 #     - object-group network blocks (members, description)
+#     - object service blocks (consumed silently — not NAT)
+#     - object-group service blocks (consumed silently)
+#     - object-group protocol blocks (consumed silently)
 #     - NAT-related object identification via description text
 #
 # USAGE:
@@ -39,19 +42,27 @@
 #   Primary  : RUNNING-CONFIG-ALL
 #   Fallback : RUNNING-CONFIG
 #
-# FTD MIGRATION NOTES GENERATED FOR:
-#   - Inactive NAT rules (not supported on FTD)
-#   - Dynamic interface PAT (requires FMC NAT policy)
-#   - Twice NAT rules (must be manually recreated in FMC)
-#   - Object NAT rules (can use FMT but verify post-migration)
-#   - no-proxy-arp and route-lookup flags
-#   - NAT rule count and complexity assessment
-#
 # THREE-LAYER PARSING ARCHITECTURE:
 #   Layer 1 — Full match against documented ASA NAT syntax
 #   Layer 2 — Partial match — line looks NAT-related but
 #             didn't fully parse — flagged [PARTIAL]
-#   Layer 3 — Unmatched capture — nothing silently dropped
+#   Layer 3 — Unmatched capture — only lines in a NAT-related
+#             context that match no known pattern. Non-NAT
+#             config in RUNNING-CONFIG-ALL is silently skipped.
+#
+# NAT CONTEXT KEYWORDS (used to identify unmatched lines):
+#   nat, object, object-group, network-object,
+#   group-object, host, subnet, range, fqdn
+#   NOTE: 'description' intentionally excluded — top-level
+#   description lines are not NAT-related. Only indented
+#   description lines inside object blocks are captured.
+#
+# SILENTLY CONSUMED BLOCK TYPES:
+#   object service, object-group service,
+#   object-group protocol
+#   These appear in RUNNING-CONFIG-ALL alongside NAT config
+#   but are not NAT-relevant. Their indented sub-lines are
+#   consumed without generating unmatched entries.
 # ============================================================
 
 import re
@@ -78,6 +89,8 @@ def extract_sections(filepath):
     """
     Reads the log file and returns:
       { section_name: [raw lines with leading whitespace preserved] }
+    Leading whitespace is preserved — indentation carries
+    structural meaning in ASA object blocks.
     """
     sections_data = {}
     current_section = None
@@ -100,7 +113,7 @@ def extract_sections(filepath):
 # NAT REGEX PATTERNS
 # ════════════════════════════════════════════════════════════
 
-# ── Twice NAT (global, outside any object block) ──────────────
+# ── Twice NAT (global, outside any object block) ─────────────
 #
 # Full documented syntax:
 #   nat (<src-iface>,<dst-iface>) [line <n>] [after-auto]
@@ -108,10 +121,6 @@ def extract_sections(filepath):
 #     [destination <static|dynamic> <real> <mapped>]
 #     [dns] [no-proxy-arp] [route-lookup] [inactive]
 #     [unidirectional] [description <text>]
-#
-# Interface pair is always (<word>,<word>) — may have spaces
-# after comma. Both interface names may contain hyphens,
-# underscores, digits.
 
 RE_TWICE_NAT = re.compile(
     r'^nat\s+'
@@ -126,7 +135,7 @@ RE_TWICE_NAT = re.compile(
     re.IGNORECASE
 )
 
-# ── Object NAT (inside object network block) ──────────────────
+# ── Object NAT (inside object network block, indented) ────────
 #
 # Full documented syntax:
 #   nat (<src-iface>,<dst-iface>)
@@ -138,7 +147,7 @@ RE_OBJECT_NAT = re.compile(
     r'^\s+nat\s+'
     r'\(\s*(\S+)\s*,\s*(\S+)\s*\)'     # (src-iface, dst-iface)
     r'\s+(static|dynamic)\s+'          # action
-    r'(\S+)'                           # mapped (ip, object name, or 'interface')
+    r'(\S+)'                           # mapped (ip, object, or 'interface')
     r'(.*?)$',                         # rest (mask, options)
     re.IGNORECASE
 )
@@ -149,12 +158,12 @@ RE_OBJ_NETWORK = re.compile(
     re.IGNORECASE
 )
 
-# Object network sub-commands (indented)
-RE_OBJ_HOST    = re.compile(r'^\s+host\s+(\S+)', re.IGNORECASE)
-RE_OBJ_SUBNET  = re.compile(r'^\s+subnet\s+(\S+)\s+(\S+)', re.IGNORECASE)
-RE_OBJ_RANGE   = re.compile(r'^\s+range\s+(\S+)\s+(\S+)', re.IGNORECASE)
-RE_OBJ_FQDN    = re.compile(r'^\s+fqdn\s+(\S+)', re.IGNORECASE)
-RE_OBJ_DESC    = re.compile(r'^\s+description\s+(.*)', re.IGNORECASE)
+# object network sub-commands (indented)
+RE_OBJ_HOST   = re.compile(r'^\s+host\s+(\S+)', re.IGNORECASE)
+RE_OBJ_SUBNET = re.compile(r'^\s+subnet\s+(\S+)\s+(\S+)', re.IGNORECASE)
+RE_OBJ_RANGE  = re.compile(r'^\s+range\s+(\S+)\s+(\S+)', re.IGNORECASE)
+RE_OBJ_FQDN   = re.compile(r'^\s+fqdn\s+(\S+)', re.IGNORECASE)
+RE_OBJ_DESC   = re.compile(r'^\s+description\s+(.*)', re.IGNORECASE)
 
 # ── object-group network block header ────────────────────────
 RE_OBJ_GRP_NETWORK = re.compile(
@@ -162,7 +171,7 @@ RE_OBJ_GRP_NETWORK = re.compile(
     re.IGNORECASE
 )
 
-# Object-group sub-commands (indented)
+# object-group network sub-commands (indented)
 RE_GRP_NET_OBJ  = re.compile(
     r'^\s+network-object\s+object\s+(\S+)',
     re.IGNORECASE
@@ -175,9 +184,25 @@ RE_GRP_NET_CIDR = re.compile(
     r'^\s+network-object\s+(\S+)\s+(\S+)',
     re.IGNORECASE
 )
-RE_GRP_DESC     = re.compile(r'^\s+description\s+(.*)', re.IGNORECASE)
-RE_GRP_GRP      = re.compile(
-    r'^\s+group-object\s+(\S+)',
+RE_GRP_DESC = re.compile(r'^\s+description\s+(.*)', re.IGNORECASE)
+RE_GRP_GRP  = re.compile(r'^\s+group-object\s+(\S+)', re.IGNORECASE)
+
+# ── Non-NAT object block headers (silently consumed) ──────────
+# object service, object-group service, object-group protocol
+# These appear in RUNNING-CONFIG-ALL alongside NAT config but
+# are not NAT-relevant. We consume their indented sub-lines
+# silently to prevent unmatched line capture.
+
+RE_OBJ_SERVICE      = re.compile(
+    r'^object service\s+\S+',
+    re.IGNORECASE
+)
+RE_OBJ_GRP_SERVICE  = re.compile(
+    r'^object-group service\s+\S+',
+    re.IGNORECASE
+)
+RE_OBJ_GRP_PROTOCOL = re.compile(
+    r'^object-group protocol\s+\S+',
     re.IGNORECASE
 )
 
@@ -203,13 +228,23 @@ RE_SERVICE_CLAUSE = re.compile(
 )
 
 # ── Partial match triggers ────────────────────────────────────
-# Any line starting with 'nat' at column 0 (Twice NAT attempt)
+# Non-indented 'nat' line that didn't fully parse
 RE_NAT_PARTIAL = re.compile(r'^nat\s+', re.IGNORECASE)
-# Any indented 'nat' line (Object NAT attempt)
+# Indented 'nat' line inside object block that didn't fully parse
 RE_NAT_OBJ_PARTIAL = re.compile(r'^\s+nat\s+', re.IGNORECASE)
 
-# NAT-related description keyword
+# NAT keyword in description text
 RE_NAT_DESC_KEYWORD = re.compile(r'\bnat\b', re.IGNORECASE)
+
+# ── NAT context keyword set ───────────────────────────────────
+# Used to decide whether an unmatched line should be captured.
+# 'description' is intentionally EXCLUDED — top-level description
+# lines are not NAT-related. Only indented ones inside object
+# blocks are captured, and those are handled explicitly above.
+NAT_CONTEXT_KEYWORDS = {
+    'nat', 'object', 'object-group', 'network-object',
+    'group-object', 'host', 'subnet', 'range', 'fqdn',
+}
 
 
 # ════════════════════════════════════════════════════════════
@@ -253,11 +288,11 @@ def parse_nat_options(rest):
         opts['service_real']   = sm.group(2)
         opts['service_mapped'] = sm.group(3)
 
-    # Description (inline on nat line)
+    # Inline description on nat line
     desc_m = RE_DESCRIPTION.search(rest)
     if desc_m:
-        # Strip trailing option keywords from description
         desc_text = desc_m.group(1).strip()
+        # Strip trailing option keywords from description text
         for kw in ['no-proxy-arp', 'route-lookup', 'inactive',
                    'unidirectional', 'dns', 'net-to-net']:
             desc_text = re.sub(
@@ -280,7 +315,7 @@ def parse_nat(lines):
     Uses three-layer architecture:
       Layer 1 — Full match
       Layer 2 — Partial match (NAT-like but unparseable)
-      Layer 3 — Unmatched capture
+      Layer 3 — Unmatched capture (NAT-context lines only)
 
     Returns:
       twice_nat_rules  : [ rule_dict ]
@@ -296,7 +331,7 @@ def parse_nat(lines):
         'dst_iface'     : str,
         'line_num'      : str or None,
         'after_auto'    : bool,
-        'src_action'    : str,   # static / dynamic
+        'src_action'    : str,    # static / dynamic
         'src_real'      : str,
         'src_mapped'    : str,
         'dst_action'    : str or None,
@@ -319,8 +354,8 @@ def parse_nat(lines):
         'object_name'   : str,
         'src_iface'     : str,
         'dst_iface'     : str,
-        'action'        : str,   # static / dynamic
-        'mapped'        : str,   # ip, object name, or 'interface'
+        'action'        : str,    # static / dynamic
+        'mapped'        : str,    # ip, object name, or 'interface'
         'mapped_mask'   : str or None,
         'no_proxy_arp'  : bool,
         'route_lookup'  : bool,
@@ -332,21 +367,21 @@ def parse_nat(lines):
         'raw'           : str,
     }
 
-    network_objects dict:
+    network_objects dict values:
     {
         'name'        : str,
         'type'        : str,   # host / subnet / range / fqdn / empty
-        'value'       : str,   # IP, network/mask, range, fqdn
+        'value'       : str or None,
         'description' : str or None,
         'has_nat'     : bool,
-        'nat_desc_ref': bool,  # description contains NAT keyword
+        'nat_desc_ref': bool,  # description contains 'nat' keyword
     }
 
-    network_groups dict:
+    network_groups dict values:
     {
         'name'        : str,
         'description' : str or None,
-        'members'     : [ member_dict ],
+        'members'     : [ { 'type': str, 'value': str } ],
         'nat_desc_ref': bool,
     }
     """
@@ -357,37 +392,56 @@ def parse_nat(lines):
     nat_partials     = []
     unmatched_nat    = []
 
-    # Block state
-    current_obj_network = None
-    current_obj_group   = None
+    # ── Block state tracking ──────────────────────────────────
+    # Only one block type can be active at a time.
+    current_obj_network   = None   # active object network block
+    current_obj_group     = None   # active object-group network block
+    current_non_nat_block = False  # inside service/protocol block
+    #   (non-NAT blocks whose indented lines are silently consumed)
 
-    # Lines we care about — NAT lines, object blocks, object-group blocks
-    # Everything else is silently passed (routing, aaa, logging, etc.)
-    # We only capture unmatched lines that look NAT-related
-    NAT_CONTEXT_KEYWORDS = {
-        'nat', 'object', 'object-group', 'network-object',
-        'group-object', 'host', 'subnet', 'range', 'fqdn',
-        'description',
-    }
+    def reset_block_state():
+        nonlocal current_obj_network, current_obj_group
+        nonlocal current_non_nat_block
+        current_obj_network   = None
+        current_obj_group     = None
+        current_non_nat_block = False
 
-    def line_looks_nat_related(s):
-        first_word = s.split()[0].lower() if s.split() else ''
+    def line_looks_nat_related(stripped):
+        """Returns True if an unmatched line should be captured."""
+        first_word = stripped.split()[0].lower() if stripped.split() else ''
         return first_word in NAT_CONTEXT_KEYWORDS
 
     for line in lines:
         if not line.strip():
-            # Blank line ends current block context
-            # but we don't reset — indented sub-lines
-            # may follow after a blank in some ASA versions
             continue
 
         stripped = line.strip()
-        first_word = stripped.split()[0].lower() if stripped.split() else ''
+
+        # ── Non-NAT block sub-lines (silently consumed) ───────
+        # Must check FIRST — when inside a service/protocol block
+        # all indented lines are consumed without capture.
+        if current_non_nat_block:
+            if line.startswith(' ') or line.startswith('\t'):
+                continue
+            else:
+                # Non-indented line = block ended, fall through
+                current_non_nat_block = False
+
+        # ── Non-NAT block headers ─────────────────────────────
+        # object service, object-group service,
+        # object-group protocol
+        # Enter silent consume mode for their sub-lines.
+        if RE_OBJ_SERVICE.match(stripped) or \
+           RE_OBJ_GRP_SERVICE.match(stripped) or \
+           RE_OBJ_GRP_PROTOCOL.match(stripped):
+            reset_block_state()
+            current_non_nat_block = True
+            continue
 
         # ── object network header ─────────────────────────────
         m = RE_OBJ_NETWORK.match(stripped)
         if m:
-            current_obj_group = None
+            reset_block_state()
             name = m.group(1)
             current_obj_network = {
                 'name'        : name,
@@ -437,7 +491,7 @@ def parse_nat(lines):
                     current_obj_network['value'] = m.group(1)
                     continue
 
-                # description
+                # description (indented — captured)
                 m = RE_OBJ_DESC.match(line)
                 if m:
                     desc = m.group(1).strip()
@@ -446,7 +500,7 @@ def parse_nat(lines):
                         current_obj_network['nat_desc_ref'] = True
                     continue
 
-                # Object NAT line (Layer 1)
+                # Object NAT line (Layer 1 — full match)
                 m = RE_OBJECT_NAT.match(line)
                 if m:
                     current_obj_network['has_nat'] = True
@@ -454,20 +508,22 @@ def parse_nat(lines):
                     opts = parse_nat_options(rest)
 
                     # Extract mapped mask if present
-                    # Mapped mask appears immediately after mapped token
+                    # Appears immediately after mapped token
                     # before any option keywords
                     mapped_mask = None
-                    rest_tokens = rest.strip().split()
                     option_keywords = {
                         'no-proxy-arp', 'route-lookup', 'inactive',
                         'dns', 'net-to-net', 'unidirectional',
                         'description', 'service',
                     }
+                    rest_tokens = rest.strip().split()
                     if rest_tokens and \
                        rest_tokens[0].lower() not in option_keywords:
-                        # First token after mapped is a mask
                         candidate = rest_tokens[0]
-                        if re.match(r'^\d+\.\d+\.\d+\.\d+$', candidate):
+                        # Subnet mask format: x.x.x.x
+                        if re.match(
+                            r'^\d+\.\d+\.\d+\.\d+$', candidate
+                        ):
                             mapped_mask = candidate
 
                     object_nat_rules.append({
@@ -494,18 +550,18 @@ def parse_nat(lines):
                     continue
 
                 # Any other indented line inside object network
-                # — not NAT-related, skip silently
+                # — not NAT-relevant, skip silently
                 continue
 
             else:
-                # Non-indented = object block ended
+                # Non-indented = object network block ended
                 current_obj_network = None
                 # Fall through to process this line normally
 
         # ── object-group network header ───────────────────────
         m = RE_OBJ_GRP_NETWORK.match(stripped)
         if m:
-            current_obj_network = None
+            reset_block_state()
             name = m.group(1)
             current_obj_group = {
                 'name'        : name,
@@ -516,12 +572,12 @@ def parse_nat(lines):
             network_groups[name] = current_obj_group
             continue
 
-        # ── object-group sub-commands ─────────────────────────
+        # ── object-group network sub-commands ─────────────────
         if current_obj_group is not None:
             is_indented = line.startswith(' ') or line.startswith('\t')
 
             if is_indented:
-                # description
+                # description (indented — captured)
                 m = RE_GRP_DESC.match(line)
                 if m:
                     desc = m.group(1).strip()
@@ -570,7 +626,7 @@ def parse_nat(lines):
                 continue
 
             else:
-                # Non-indented = group block ended
+                # Non-indented = object-group block ended
                 current_obj_group = None
                 # Fall through
 
@@ -606,14 +662,14 @@ def parse_nat(lines):
             continue
 
         # Layer 2: Partial match — looks like a NAT line
+        # but didn't fully parse
         if RE_NAT_PARTIAL.match(stripped):
             nat_partials.append(stripped)
             continue
 
-        # For all other lines — only capture as unmatched if
-        # they look NAT-related. Everything else (routing, aaa,
-        # crypto, etc.) in RUNNING-CONFIG-ALL is intentionally
-        # skipped — we are only parsing NAT context here.
+        # Layer 3: Unmatched — only capture if NAT-context related.
+        # Everything else in RUNNING-CONFIG-ALL (routing, aaa,
+        # crypto, logging, etc.) is silently skipped.
         if line_looks_nat_related(stripped):
             unmatched_nat.append(stripped)
 
@@ -686,34 +742,34 @@ def print_twice_nat(twice_nat_rules):
     ):
         print(f"     {pair:<40} {count:>10}")
 
-    # ── Rule type breakdown ───────────────────────────────────
+    # ── Rule detail table ─────────────────────────────────────
     print(f"\n     RULE DETAIL")
     print(f"     " + "=" * 60)
     print(f"     {'#':<5} {'IFACE PAIR':<25} {'SRC ACTION':<10}"
           f" {'SRC REAL':<20} {'SRC MAPPED':<20} {'FLAGS'}")
     print(f"     {'-'*4} {'-'*24} {'-'*9} {'-'*19}"
-          f" {'-'*19} {'-'*15}")
+          f" {'-'*19} {'-'*20}")
 
     for i, r in enumerate(twice_nat_rules, 1):
         pair  = f"({r['src_iface']},{r['dst_iface']})"
         flags = []
-        if r['inactive']:      flags.append('INACTIVE')
-        if r['no_proxy_arp']:  flags.append('no-proxy-arp')
-        if r['route_lookup']:  flags.append('route-lookup')
-        if r['dns']:           flags.append('dns')
-        if r['unidirectional']:flags.append('unidirect')
-        if r['after_auto']:    flags.append('after-auto')
-        if r['dst_action']:    flags.append('2x-NAT')
-        if r['service_proto']: flags.append(f"svc:{r['service_proto']}")
+        if r['inactive']:       flags.append('INACTIVE')
+        if r['no_proxy_arp']:   flags.append('no-proxy-arp')
+        if r['route_lookup']:   flags.append('route-lookup')
+        if r['dns']:            flags.append('dns')
+        if r['unidirectional']: flags.append('unidirect')
+        if r['after_auto']:     flags.append('after-auto')
+        if r['dst_action']:     flags.append('2x-NAT')
+        if r['service_proto']:  flags.append(f"svc:{r['service_proto']}")
         flag_str = ' '.join(flags)
 
         print(f"     {i:<5} {pair:<25} {r['src_action']:<10}"
               f" {r['src_real']:<20} {r['src_mapped']:<20}"
               f" {flag_str}")
 
-        # Print destination NAT clause if present
+        # Print destination NAT clause on next line if present
         if r['dst_action']:
-            print(f"            destination {r['dst_action']}"
+            print(f"           destination {r['dst_action']}"
                   f" {r['dst_real']} -> {r['dst_mapped']}")
 
     # ── Migration notes ───────────────────────────────────────
@@ -721,16 +777,17 @@ def print_twice_nat(twice_nat_rules):
     print(f"     " + "=" * 60)
 
     print(f"     * Twice NAT rules require manual recreation in FMC.")
-    print(f"       FMT does not migrate Twice NAT automatically.")
-    print(f"       Navigate: FMC > Devices > NAT > Add Rule > Manual NAT")
+    print(f"       FMT does NOT migrate Twice NAT automatically.")
+    print(f"       In FMC: Devices > NAT > Add Rule > Manual NAT")
 
     if inactive:
-        print(f"\n     * [BLOCKER] {len(inactive)} inactive rule(s) must be")
-        print(f"       removed — FTD does not support 'inactive' in NAT.")
+        print(f"\n     * [BLOCKER] {len(inactive)} inactive rule(s) must")
+        print(f"       be removed before migration — FTD does not")
+        print(f"       support the 'inactive' keyword in NAT rules.")
 
     if with_dest:
         print(f"\n     * {len(with_dest)} rule(s) use destination NAT.")
-        print(f"       These are the most complex rules — verify traffic")
+        print(f"       These are the most complex rules. Verify traffic")
         print(f"       flow and object references carefully in FMC.")
 
     if dynamic_src:
@@ -745,7 +802,8 @@ def print_twice_nat(twice_nat_rules):
     if unidirect:
         print(f"\n     * {len(unidirect)} unidirectional rule(s).")
         print(f"       FTD supports unidirectional NAT — verify the")
-        print(f"       'Do not translate' option is set correctly in FMC.")
+        print(f"       'Do not translate' option is set in FMC.")
+
     print()
 
 
@@ -798,9 +856,9 @@ def print_object_nat(object_nat_rules, network_objects):
     print(f"\n     RULE DETAIL")
     print(f"     " + "=" * 60)
     print(f"     {'#':<5} {'OBJECT':<25} {'IFACE PAIR':<22}"
-          f" {'ACTION':<10} {'MAPPED TO':<20} {'FLAGS'}")
+          f" {'ACTION':<10} {'MAPPED TO':<22} {'FLAGS'}")
     print(f"     {'-'*4} {'-'*24} {'-'*21} {'-'*9}"
-          f" {'-'*19} {'-'*15}")
+          f" {'-'*21} {'-'*15}")
 
     for i, r in enumerate(object_nat_rules, 1):
         pair  = f"({r['src_iface']},{r['dst_iface']})"
@@ -817,22 +875,23 @@ def print_object_nat(object_nat_rules, network_objects):
             mapped += f" {r['mapped_mask']}"
 
         print(f"     {i:<5} {r['object_name']:<25} {pair:<22}"
-              f" {r['action']:<10} {mapped:<20} {flag_str}")
+              f" {r['action']:<10} {mapped:<22} {flag_str}")
 
     # ── Dynamic interface PAT detail ──────────────────────────
     if pat_iface:
         print(f"\n     DYNAMIC INTERFACE PAT RULES ({len(pat_iface)})")
         print(f"     " + "=" * 60)
         print(f"     These rules perform PAT using the interface IP.")
-        print(f"     In FMC: Add Object NAT rule > Dynamic >"
-              f" Translated Addr = Interface.")
+        print(f"     In FMC: Object NAT rule > Dynamic >")
+        print(f"     Translated Address = Interface.")
         for r in pat_iface:
-            obj = network_objects.get(r['object_name'], {})
-            obj_val = obj.get('value', '(unknown)')
+            obj      = network_objects.get(r['object_name'], {})
+            obj_val  = obj.get('value', '(unknown)')
             obj_type = obj.get('type', 'unknown')
-            print(f"       Object: {r['object_name']}"
-                  f" ({obj_type}: {obj_val})"
-                  f" -> interface ({r['src_iface']},{r['dst_iface']})")
+            print(f"       Object : {r['object_name']}")
+            print(f"         Type : {obj_type} ({obj_val})")
+            print(f"         NAT  : dynamic interface"
+                  f" ({r['src_iface']},{r['dst_iface']})")
 
     # ── Migration notes ───────────────────────────────────────
     print(f"\n     OBJECT NAT MIGRATION NOTES")
@@ -843,18 +902,19 @@ def print_object_nat(object_nat_rules, network_objects):
 
     if pat_iface:
         print(f"\n     * {len(pat_iface)} interface PAT rule(s) detected.")
-        print(f"       Verify the correct interface is selected in FMC")
-        print(f"       NAT policy post-migration.")
+        print(f"       Verify the correct egress interface is selected")
+        print(f"       in FMC NAT policy post-migration.")
 
     if with_svc:
         print(f"\n     * {len(with_svc)} rule(s) include service clauses.")
         print(f"       FTD supports service NAT — verify port translation")
         print(f"       is configured correctly in FMC.")
+
     print()
 
 
 # ════════════════════════════════════════════════════════════
-# PRINT: NETWORK OBJECTS
+# PRINT: NETWORK OBJECTS AND GROUPS
 # ════════════════════════════════════════════════════════════
 
 def print_network_objects(network_objects, network_groups):
@@ -866,15 +926,15 @@ def print_network_objects(network_objects, network_groups):
     if not network_objects:
         print("     None detected.")
     else:
-        # Summary by type
+        # Type breakdown
         type_counts = defaultdict(int)
         for obj in network_objects.values():
             type_counts[obj['type']] += 1
 
-        nat_objects     = [o for o in network_objects.values()
-                           if o['has_nat']]
-        nat_desc_refs   = [o for o in network_objects.values()
-                           if o['nat_desc_ref'] and not o['has_nat']]
+        nat_objects   = [o for o in network_objects.values()
+                         if o['has_nat']]
+        nat_desc_refs = [o for o in network_objects.values()
+                         if o['nat_desc_ref'] and not o['has_nat']]
 
         print(f"     Object type breakdown:")
         for otype, count in sorted(
@@ -885,21 +945,23 @@ def print_network_objects(network_objects, network_groups):
         print(f"\n     Objects with inline NAT  : {len(nat_objects)}")
         print(f"     NAT-referenced by desc   : {len(nat_desc_refs)}")
 
-        # NAT-purposed objects identified by description
+        # NAT-purposed objects flagged by description
         if nat_desc_refs:
-            print(f"\n     OBJECTS WITH NAT IN DESCRIPTION"
-                  f" (no inline NAT defined):")
-            print(f"     These objects are referenced by NAT rules but")
-            print(f"     have no inline Object NAT — likely used in")
-            print(f"     Twice NAT rules above.")
-            for obj in nat_desc_refs[:20]:
-                val = obj['value'] or '(no value)'
-                desc = obj['description'] or ''
-                print(f"       {obj['name']:<30}"
-                      f" {obj['type']:<10} {val:<20}"
-                      f" [{desc[:30]}]")
-            if len(nat_desc_refs) > 20:
-                print(f"       ... and {len(nat_desc_refs) - 20} more")
+            print(f"\n     OBJECTS WITH 'NAT' IN DESCRIPTION"
+                  f" (no inline Object NAT defined):")
+            print(f"     These objects are likely referenced by Twice NAT")
+            print(f"     rules. They must exist in FMC before NAT policy")
+            print(f"     is deployed.")
+            print(f"     {'OBJECT NAME':<35} {'TYPE':<10}"
+                  f" {'VALUE':<22} {'DESCRIPTION'}")
+            print(f"     {'-'*34} {'-'*9} {'-'*21} {'-'*30}")
+            for obj in nat_desc_refs[:30]:
+                val  = obj['value'] or '(no value)'
+                desc = (obj['description'] or '')[:30]
+                print(f"     {obj['name']:<35} {obj['type']:<10}"
+                      f" {val:<22} {desc}")
+            if len(nat_desc_refs) > 30:
+                print(f"     ... and {len(nat_desc_refs) - 30} more")
 
     # ── Object-group inventory ────────────────────────────────
     print(f"\n  ── NETWORK OBJECT-GROUP INVENTORY"
@@ -915,23 +977,25 @@ def print_network_objects(network_objects, network_groups):
         print(f"     NAT-referenced by desc   : {len(nat_grp_refs)}")
 
         if nat_grp_refs:
-            print(f"\n     OBJECT-GROUPS WITH NAT IN DESCRIPTION:")
+            print(f"\n     OBJECT-GROUPS WITH 'NAT' IN DESCRIPTION:")
+            print(f"     {'GROUP NAME':<40} {'MEMBERS':>8}"
+                  f"  {'DESCRIPTION'}")
+            print(f"     {'-'*39} {'-'*8}  {'-'*30}")
             for grp in nat_grp_refs:
-                member_count = len(grp['members'])
-                desc = grp['description'] or ''
-                print(f"       {grp['name']:<35}"
-                      f" members: {member_count:<5}"
-                      f" [{desc[:35]}]")
+                desc = (grp['description'] or '')[:35]
+                print(f"     {grp['name']:<40}"
+                      f" {len(grp['members']):>8}  {desc}")
 
         print(f"\n     [MIGRATION NOTE] All network objects and")
         print(f"     object-groups must exist in FMC before NAT")
         print(f"     rules are deployed. FMT migrates objects")
         print(f"     automatically — verify post-migration.")
+
     print()
 
 
 # ════════════════════════════════════════════════════════════
-# PRINT: NAT GLOBAL SUMMARY
+# PRINT: GLOBAL NAT SUMMARY
 # ════════════════════════════════════════════════════════════
 
 def print_nat_summary(twice_nat_rules, object_nat_rules,
@@ -943,10 +1007,12 @@ def print_nat_summary(twice_nat_rules, object_nat_rules,
     print(f"  NAT MIGRATION SUMMARY")
     print(f"  {'='*78}")
 
-    total_nat = len(twice_nat_rules) + len(object_nat_rules)
-    inactive  = [r for r in twice_nat_rules if r['inactive']]
-    pat_iface = [r for r in object_nat_rules
-                 if r['mapped'].lower() == 'interface']
+    total_nat   = len(twice_nat_rules) + len(object_nat_rules)
+    inactive    = [r for r in twice_nat_rules if r['inactive']]
+    pat_iface   = [r for r in object_nat_rules
+                   if r['mapped'].lower() == 'interface']
+    with_dest   = [r for r in twice_nat_rules if r['dst_action']]
+    after_auto  = [r for r in twice_nat_rules if r['after_auto']]
 
     print(f"  Total NAT rules          : {total_nat}")
     print(f"  Twice NAT rules          : {len(twice_nat_rules)}")
@@ -955,48 +1021,84 @@ def print_nat_summary(twice_nat_rules, object_nat_rules,
     print(f"  Network groups parsed    : {len(network_groups)}")
     print(f"  Inactive NAT rules       : {len(inactive)}")
     print(f"  Interface PAT rules      : {len(pat_iface)}")
+    print(f"  Destination NAT rules    : {len(with_dest)}")
+    print(f"  After-auto rules         : {len(after_auto)}")
     print(f"  Partial matches          : {len(nat_partials)}")
+    print(f"  Unmatched NAT lines      : {len(unmatched_nat)}")
 
     print(f"\n  RISK ASSESSMENT")
     print(f"  " + "=" * 60)
 
-    risks = []
+    risks_high   = []
+    risks_medium = []
+    risks_info   = []
 
     if inactive:
-        risks.append(
-            f"[HIGH] {len(inactive)} inactive Twice NAT rule(s) — "
-            "must remove before FTD migration"
+        risks_high.append(
+            f"{len(inactive)} inactive Twice NAT rule(s) — "
+            "must remove before FTD migration (inactive not supported)"
         )
 
     if twice_nat_rules:
-        risks.append(
-            f"[HIGH] {len(twice_nat_rules)} Twice NAT rule(s) require "
-            "manual recreation in FMC — FMT does not migrate these"
+        risks_high.append(
+            f"{len(twice_nat_rules)} Twice NAT rule(s) require "
+            "manual recreation in FMC — FMT does NOT migrate these"
+        )
+
+    if with_dest:
+        risks_high.append(
+            f"{len(with_dest)} destination NAT rule(s) — highest "
+            "complexity, verify traffic flow carefully in FMC"
         )
 
     if object_nat_rules:
-        risks.append(
-            f"[MEDIUM] {len(object_nat_rules)} Object NAT rule(s) — "
+        risks_medium.append(
+            f"{len(object_nat_rules)} Object NAT rule(s) — "
             "verify FMT migration output before cutover"
         )
 
     if pat_iface:
-        risks.append(
-            f"[MEDIUM] {len(pat_iface)} interface PAT rule(s) — "
+        risks_medium.append(
+            f"{len(pat_iface)} interface PAT rule(s) — "
             "verify correct interface selected in FMC post-migration"
         )
 
-    if nat_partials:
-        risks.append(
-            f"[INFO] {len(nat_partials)} NAT line(s) partially matched "
-            "— review manually, may represent unsupported syntax"
+    if after_auto:
+        risks_medium.append(
+            f"{len(after_auto)} after-auto rule(s) — "
+            "map to Section 3 in FMC NAT policy (not Section 1)"
         )
 
-    if not risks:
+    if nat_partials:
+        risks_info.append(
+            f"{len(nat_partials)} NAT line(s) partially matched — "
+            "review manually, may represent unsupported syntax"
+        )
+
+    if unmatched_nat:
+        risks_info.append(
+            f"{len(unmatched_nat)} unmatched NAT-context line(s) — "
+            "review manually"
+        )
+
+    if not risks_high and not risks_medium and not risks_info:
         print("  [OK] No NAT migration risks detected.")
     else:
-        for r in risks:
-            print(f"  * {r}")
+        if risks_high:
+            print(f"\n  [HIGH RISK] — Will require manual action before"
+                  f" or during migration:")
+            for r in risks_high:
+                print(f"     * {r}")
+
+        if risks_medium:
+            print(f"\n  [MEDIUM RISK] — Verify post-migration:")
+            for r in risks_medium:
+                print(f"     * {r}")
+
+        if risks_info:
+            print(f"\n  [INFO] — Review:")
+            for r in risks_info:
+                print(f"     * {r}")
 
     # ── Partial lines ─────────────────────────────────────────
     if nat_partials:
@@ -1004,7 +1106,8 @@ def print_nat_summary(twice_nat_rules, object_nat_rules,
         print(f"  NAT PARTIAL MATCHES ({len(nat_partials)})")
         print(f"  {'='*78}")
         print("  These lines look like NAT statements but did not")
-        print("  fully parse. Review manually:")
+        print("  fully parse. Review manually — may represent NAT")
+        print("  syntax variants not yet covered by this parser.")
         for p in nat_partials[:20]:
             print(f"    {p[:75]}")
         if len(nat_partials) > 20:
@@ -1021,6 +1124,7 @@ def print_nat_summary(twice_nat_rules, object_nat_rules,
             print(f"    {u[:75]}")
         if len(unmatched_nat) > 20:
             print(f"    ... and {len(unmatched_nat) - 20} more")
+
     print()
 
 
@@ -1035,6 +1139,7 @@ def print_header():
     print("  NAT Analysis: Twice NAT | Object NAT |")
     print("  Network Objects | Object-Groups")
     print("  Source: RUNNING-CONFIG-ALL (fallback: RUNNING-CONFIG)")
+    print("  Non-NAT blocks silently consumed (service, protocol)")
     print("=" * 78)
     print()
 
@@ -1059,11 +1164,11 @@ def main():
     sections_data = extract_sections(filepath)
 
     # ── Source section selection ──────────────────────────────
-    lines = sections_data.get("RUNNING-CONFIG-ALL", [])
+    lines  = sections_data.get("RUNNING-CONFIG-ALL", [])
     source = "RUNNING-CONFIG-ALL"
 
     if not lines:
-        lines = sections_data.get("RUNNING-CONFIG", [])
+        lines  = sections_data.get("RUNNING-CONFIG", [])
         source = "RUNNING-CONFIG"
 
     if not lines:
@@ -1072,8 +1177,8 @@ def main():
         print("  Verify your log file contains one of these sections.")
         sys.exit(1)
 
-    print(f"  Reading NAT from section: {source}")
-    print(f"  Total lines in section  : {len(lines)}\n")
+    print(f"  Reading NAT from section : {source}")
+    print(f"  Total lines in section   : {len(lines)}\n")
 
     # ── Parse ─────────────────────────────────────────────────
     (
@@ -1085,7 +1190,7 @@ def main():
         unmatched_nat,
     ) = parse_nat(lines)
 
-    # ── Print sections ────────────────────────────────────────
+    # ── Print ─────────────────────────────────────────────────
     print("=" * 78)
     print("  NAT ANALYSIS")
     print("=" * 78)
@@ -1096,7 +1201,7 @@ def main():
     print_nat_summary(
         twice_nat_rules, object_nat_rules,
         network_objects, network_groups,
-        nat_partials, unmatched_nat
+        nat_partials, unmatched_nat,
     )
 
 

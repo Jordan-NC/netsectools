@@ -140,19 +140,26 @@ FTD_ESP_ENCRYPTION = {
 }
 
 FTD_ESP_INTEGRITY = {
+    # ESP hash form (transform sets)
     'esp-md5-hmac'    : 'REMOVED',
     'esp-sha-hmac'    : 'DEPRECATED',
     'esp-sha256-hmac' : 'OK',
     'esp-sha384-hmac' : 'OK',
     'esp-sha512-hmac' : 'OK',
     'esp-none'        : 'OK',
-    # IKEv2 proposal form
+    # IKEv2 proposal form — no hyphen (older ASA output)
     'md5'             : 'REMOVED',
     'sha'             : 'DEPRECATED',
     'sha256'          : 'OK',
     'sha384'          : 'OK',
     'sha512'          : 'OK',
     'null'            : 'OK',
+    # IKEv2 proposal form — hyphenated (newer ASA output)
+    'sha-1'           : 'DEPRECATED',
+    'sha-256'         : 'OK',
+    'sha-384'         : 'OK',
+    'sha-512'         : 'OK',
+    'md5-96'          : 'REMOVED',
 }
 
 FTD_IKE_ENCRYPTION = {
@@ -166,13 +173,18 @@ FTD_IKE_ENCRYPTION = {
     'aes-gcm-256' : 'OK',
     'null'        : 'OK',
 }
-
 FTD_IKE_HASH = {
+    # No hyphen form
     'md5'    : 'REMOVED',
     'sha'    : 'DEPRECATED',
     'sha256' : 'OK',
     'sha384' : 'OK',
     'sha512' : 'OK',
+    # Hyphenated form
+    'sha-1'  : 'DEPRECATED',
+    'sha-256': 'OK',
+    'sha-384': 'OK',
+    'sha-512': 'OK',
 }
 
 # DH group FTD status

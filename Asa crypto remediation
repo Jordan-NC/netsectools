@@ -1,0 +1,1193 @@
+# ============================================================
+# ASA Migration Parser - Crypto Remediation Report
+# ============================================================
+# PURPOSE:
+#   Generates a per-tunnel, per-peer crypto remediation report
+#   from parsed Phase 4 crypto data. Identifies every crypto
+#   map entry that references a REMOVED or DEPRECATED algorithm,
+#   maps it to its peer IP(s) and match ACL, and provides an
+#   explicit FMC-compatible replacement recommendation.
+#
+#   This is the actionable artifact for updating staged S2S VPN
+#   configurations in FMC before cutover. The technical report
+#   flags algorithm status; this report tells you exactly what
+#   to change and what to change it to.
+#
+# USAGE — STANDALONE:
+#   python asa_crypto_remediation.py <path_to_log_file>
+#   Example: python asa_crypto_remediation.py asa_logs.txt
+#
+# USAGE — FROM PHASE 6:
+#   from asa_crypto_remediation import build_remediation_report
+#   report = build_remediation_report(results)
+#   write_report(report, remediation_path)
+#
+# OUTPUT:
+#   asa_migration_crypto_remediation.txt
+#   Written to the same directory as the log file.
+#
+# INPUT DEPENDENCIES (from parse_crypto / run_all_parsers):
+#   ikev1_ts          — IKEv1 transform sets with FTD status
+#   ikev2_proposals   — IKEv2 IPsec proposals with algorithms
+#   ikev1_policies    — IKEv1 Phase 1 policies with FTD status
+#   ikev2_policies    — IKEv2 Phase 1 policies
+#   crypto_maps       — Static crypto map entries (peer, TS, ACL)
+#   map_interfaces    — Crypto map to interface binding
+#
+# ALGORITHM REPLACEMENT LOGIC:
+#   REMOVED encryption  (DES, 3DES)     → AES-256
+#   REMOVED integrity   (MD5)           → SHA-256
+#   REMOVED DH group    (1, 2, 24)      → Group 14 (minimum)
+#   DEPRECATED integrity (SHA-1/SHA)    → SHA-256 (recommended)
+#   DEPRECATED DH group (5)             → Group 14 (minimum)
+#   All replacements are Cisco-documented, FMC 7.2.x compatible.
+#
+# REPORT STRUCTURE:
+#   Section 1 — Summary: counts by status, affected tunnel count
+#   Section 2 — Transform Set Remediation: per-TS action table
+#   Section 3 — IKEv2 Proposal Remediation: per-proposal table
+#   Section 4 — IKEv1 Phase 1 Remediation: per-policy table
+#   Section 5 — Per-Tunnel Action Table: crypto map → peer → fix
+#   Section 6 — FMC Update Checklist: ordered action items
+#   Section 7 — Unaffected Tunnels: confirmation of clean entries
+# ============================================================
+
+import re
+import sys
+import os
+from datetime import datetime
+from collections import defaultdict
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION HEADER PATTERN (shared with p4/p6)
+# ════════════════════════════════════════════════════════════
+
+SECTION_PATTERN = re.compile(
+    r'^!\s*===SECTION:\s*([A-Z0-9_\-]+)\s*===$',
+    re.IGNORECASE
+)
+
+
+# ════════════════════════════════════════════════════════════
+# REPLACEMENT RECOMMENDATION TABLES
+# Source: Cisco FMC Configuration Guide 7.2 / 7.6
+#         NIST SP 800-131A Rev 2 (algorithm deprecation)
+#
+# Logic:
+#   REMOVED algs → Minimum required replacement for FTD 6.7+
+#   DEPRECATED   → Recommended upgrade (not blocking today on
+#                  FMC 7.2.x but will fail on future versions)
+# ════════════════════════════════════════════════════════════
+
+ESP_ENC_REPLACEMENT = {
+    'esp-des'  : 'esp-aes-256',
+    'esp-3des' : 'esp-aes-256',
+    'des'      : 'aes-256',
+    '3des'     : 'aes-256',
+}
+
+ESP_INT_REPLACEMENT = {
+    'esp-md5-hmac' : 'esp-sha256-hmac',
+    'esp-sha-hmac' : 'esp-sha256-hmac',
+    'md5'          : 'sha256',
+    'sha'          : 'sha256',
+    'sha-1'        : 'sha256',
+    'md5-96'       : 'sha256',
+}
+
+IKE_ENC_REPLACEMENT = {
+    'des'  : 'aes-256',
+    '3des' : 'aes-256',
+}
+
+IKE_HASH_REPLACEMENT = {
+    'md5'   : 'sha256',
+    'sha'   : 'sha256',
+    'sha-1' : 'sha256',
+}
+
+DH_GROUP_REPLACEMENT = {
+    '1'  : '14',
+    '2'  : '14',
+    '5'  : '14',
+    '24' : '20',
+}
+
+
+# ════════════════════════════════════════════════════════════
+# REPLACEMENT LOOKUP HELPERS
+# ════════════════════════════════════════════════════════════
+
+def get_esp_enc_replacement(alg):
+    return ESP_ENC_REPLACEMENT.get(alg.lower().strip())
+
+def get_esp_int_replacement(alg):
+    if not alg:
+        return None
+    return ESP_INT_REPLACEMENT.get(alg.lower().strip())
+
+def get_ike_enc_replacement(alg):
+    return IKE_ENC_REPLACEMENT.get(alg.lower().strip())
+
+def get_ike_hash_replacement(alg):
+    return IKE_HASH_REPLACEMENT.get(alg.lower().strip())
+
+def get_dh_replacement(group):
+    g = re.sub(r'group\s*', '', str(group).lower()).strip()
+    return DH_GROUP_REPLACEMENT.get(g)
+
+def needs_action(status):
+    return status in ('REMOVED', 'DEPRECATED')
+
+
+# ════════════════════════════════════════════════════════════
+# FTD STATUS LOOKUPS (inline — avoids importing p4)
+# These mirror the FTD_* tables in asa_parser_p4.py exactly.
+# ════════════════════════════════════════════════════════════
+
+_FTD_ESP_ENCRYPTION = {
+    'esp-des': 'REMOVED', 'esp-3des': 'REMOVED',
+    'esp-aes': 'OK', 'esp-aes-192': 'OK', 'esp-aes-256': 'OK',
+    'esp-aes-gcm': 'OK', 'esp-aes-gcm-192': 'OK',
+    'esp-aes-gcm-256': 'OK', 'esp-null': 'OK',
+    'des': 'REMOVED', '3des': 'REMOVED',
+    'aes': 'OK', 'aes-192': 'OK', 'aes-256': 'OK',
+    'aes-gcm': 'OK', 'aes-gcm-192': 'OK', 'aes-gcm-256': 'OK',
+    'null': 'OK',
+}
+_FTD_ESP_INTEGRITY = {
+    'esp-md5-hmac': 'REMOVED', 'esp-sha-hmac': 'DEPRECATED',
+    'esp-sha256-hmac': 'OK', 'esp-sha384-hmac': 'OK',
+    'esp-sha512-hmac': 'OK', 'esp-none': 'OK',
+    'md5': 'REMOVED', 'sha': 'DEPRECATED', 'sha256': 'OK',
+    'sha384': 'OK', 'sha512': 'OK', 'null': 'OK', 'none': 'OK',
+    'sha-1': 'DEPRECATED', 'sha-256': 'OK',
+    'sha-384': 'OK', 'sha-512': 'OK', 'md5-96': 'REMOVED',
+}
+_FTD_IKE_ENCRYPTION = {
+    'des': 'REMOVED', '3des': 'REMOVED',
+    'aes': 'OK', 'aes-192': 'OK', 'aes-256': 'OK',
+    'aes-gcm': 'OK', 'aes-gcm-192': 'OK', 'aes-gcm-256': 'OK',
+    'null': 'OK',
+}
+_FTD_IKE_HASH = {
+    'md5': 'REMOVED', 'sha': 'DEPRECATED', 'sha256': 'OK',
+    'sha384': 'OK', 'sha512': 'OK',
+    'sha-1': 'DEPRECATED', 'sha-256': 'OK',
+    'sha-384': 'OK', 'sha-512': 'OK',
+    'null': 'OK', 'none': 'OK',
+}
+_FTD_DH_GROUPS = {
+    '1': 'REMOVED', '2': 'REMOVED', '5': 'DEPRECATED',
+    '14': 'OK', '19': 'OK', '20': 'OK', '21': 'OK', '24': 'REMOVED',
+}
+
+
+def _ftd_esp_enc_status(alg):
+    return _FTD_ESP_ENCRYPTION.get(alg.lower().strip(), 'UNKNOWN')
+
+def _ftd_esp_int_status(alg):
+    return _FTD_ESP_INTEGRITY.get(alg.lower().strip(), 'UNKNOWN')
+
+def _ftd_ike_enc_status(alg):
+    if not alg:
+        return 'UNKNOWN'
+    return _FTD_IKE_ENCRYPTION.get(alg.lower().strip(), 'UNKNOWN')
+
+def _ftd_ike_hash_status(alg):
+    if not alg:
+        return 'UNKNOWN'
+    return _FTD_IKE_HASH.get(alg.lower().strip(), 'UNKNOWN')
+
+def _ftd_dh_status(group):
+    if not group:
+        return 'UNKNOWN'
+    g = re.sub(r'group\s*', '', str(group).lower()).strip()
+    return _FTD_DH_GROUPS.get(g, 'UNKNOWN')
+
+def _short_status(status):
+    return {
+        'REMOVED'    : '[REMOVED]',
+        'DEPRECATED' : '[DEPRECATED]',
+        'OK'         : '[OK]',
+        'UNKNOWN'    : '[UNKNOWN]',
+        'N/A'        : '[N/A]',
+    }.get(status, '[UNKNOWN]')
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION HEADER HELPER
+# ════════════════════════════════════════════════════════════
+
+def _section_hdr(num, title):
+    return (
+        "\n" + "=" * 78 + "\n"
+        "  SECTION " + num + ": " + title + "\n" +
+        "=" * 78 + "\n"
+    )
+
+
+# ════════════════════════════════════════════════════════════
+# HELPER: GET AFFECTED TUNNEL ENTRIES
+# ════════════════════════════════════════════════════════════
+
+def _get_affected_tunnel_entries(
+    crypto_maps, affected_ts_names, affected_prop_names,
+    affected_ikev1_priorities
+):
+    affected = []
+    for map_name, seqs in crypto_maps.items():
+        for entry in seqs.values():
+            ts_refs   = set(entry.get('ikev1_ts', []))
+            prop_refs = set(entry.get('ikev2_prop', []))
+            if ts_refs & affected_ts_names or prop_refs & affected_prop_names:
+                affected.append((map_name, entry))
+    return affected
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 1: SUMMARY
+# ════════════════════════════════════════════════════════════
+
+def _build_summary(
+    ikev1_ts, ikev2_proposals, ikev1_policies, ikev2_policies,
+    crypto_maps, affected_ts_names, removed_ts_names,
+    affected_prop_names, removed_prop_names,
+    affected_ikev1_priorities, affected_tunnel_entries
+):
+    out = []
+
+    total_ts    = len(ikev1_ts)
+    affected_ts = len(affected_ts_names)
+    removed_ts  = len(removed_ts_names)
+
+    total_prop    = len(ikev2_proposals)
+    affected_prop = len(affected_prop_names)
+    removed_prop  = len(removed_prop_names)
+
+    total_pol    = len(ikev1_policies)
+    affected_pol = len(affected_ikev1_priorities)
+
+    total_tunnel_entries = sum(len(v) for v in crypto_maps.values())
+    affected_entries     = len(affected_tunnel_entries)
+    total_peers = sum(
+        len(entry.get('peers', []))
+        for seqs in crypto_maps.values()
+        for entry in seqs.values()
+    )
+    affected_peers = sum(
+        len(entry.get('peers', []))
+        for (_, entry) in affected_tunnel_entries
+    )
+
+    has_blocking = removed_ts > 0 or removed_prop > 0
+
+    if has_blocking:
+        out.append("  STATUS: ACTION REQUIRED BEFORE FMC DEPLOYMENT")
+        out.append(
+            "  One or more REMOVED algorithms are present. Crypto map\n"
+            "  entries referencing these algorithms cannot be deployed\n"
+            "  to FTD until the transform sets or proposals are updated."
+        )
+    elif affected_ts > 0 or affected_prop > 0 or affected_pol > 0:
+        out.append("  STATUS: CLEANUP RECOMMENDED")
+        out.append(
+            "  No REMOVED algorithms detected. DEPRECATED algorithms\n"
+            "  are present and should be upgraded as part of migration."
+        )
+    else:
+        out.append("  STATUS: NO CRYPTO REMEDIATION REQUIRED")
+        out.append(
+            "  All algorithms are fully supported on FTD. No changes\n"
+            "  to crypto configuration are needed before deployment."
+        )
+
+    out.append("")
+    out.append("  COUNTS")
+    out.append("  " + "-" * 50)
+    out.append(f"  {'COMPONENT':<38} {'TOTAL':>6} {'AFFECTED':>9}")
+    out.append(f"  {'-'*38} {'-'*6} {'-'*9}")
+    out.append(f"  {'IKEv1 Transform Sets':<38} {total_ts:>6} {affected_ts:>9}")
+    out.append(f"  {'  of which REMOVED':<38} {'':>6} {removed_ts:>9}")
+    out.append(f"  {'IKEv2 IPsec Proposals':<38} {total_prop:>6} {affected_prop:>9}")
+    out.append(f"  {'  of which REMOVED':<38} {'':>6} {removed_prop:>9}")
+    out.append(f"  {'IKEv1 Phase 1 Policies':<38} {total_pol:>6} {affected_pol:>9}")
+    out.append(f"  {'Crypto Map Entries (tunnels)':<38} {total_tunnel_entries:>6} {affected_entries:>9}")
+    out.append(f"  {'Peer IP Addresses affected':<38} {total_peers:>6} {affected_peers:>9}")
+    out.append("")
+
+    if affected_ts_names:
+        out.append("  TRANSFORM SETS REQUIRING UPDATE:")
+        for name in sorted(affected_ts_names):
+            marker = (
+                " [DEPLOYMENT BLOCKER]"
+                if name in removed_ts_names
+                else " [DEPRECATED]"
+            )
+            out.append(f"    * {name}{marker}")
+        out.append("")
+
+    if affected_prop_names:
+        out.append("  IKEV2 PROPOSALS REQUIRING UPDATE:")
+        for name in sorted(affected_prop_names):
+            marker = (
+                " [DEPLOYMENT BLOCKER]"
+                if name in removed_prop_names
+                else " [DEPRECATED]"
+            )
+            out.append(f"    * {name}{marker}")
+        out.append("")
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 2: TRANSFORM SET REMEDIATION
+# ════════════════════════════════════════════════════════════
+
+def _build_ts_remediation(ikev1_ts):
+    out = []
+
+    affected = [
+        ts for ts in ikev1_ts
+        if needs_action(ts['ftd_enc']) or
+           (needs_action(ts['ftd_hash']) and ts['ftd_hash'] != 'N/A')
+    ]
+    clean = [ts for ts in ikev1_ts if ts not in affected]
+
+    if not affected:
+        out.append("  [OK] All IKEv1 transform sets use supported algorithms.")
+        out.append("  No changes required.")
+        out.append("")
+        return out
+
+    out.append(
+        f"  {len(affected)} transform set(s) require updating. "
+        f"{len(clean)} are unaffected.\n"
+    )
+
+    W_NAME = 26
+    W_CUR  = 20
+    W_STS  = 14
+    W_NEW  = 20
+
+    for ts in sorted(affected, key=lambda x: x['name']):
+        enc_status  = ts['ftd_enc']
+        hash_status = ts['ftd_hash']
+        enc_new     = get_esp_enc_replacement(ts['esp_enc']) or ts['esp_enc']
+        hash_new    = (
+            get_esp_int_replacement(ts.get('esp_hash', ''))
+            or ts.get('esp_hash', '—')
+        ) if ts.get('esp_hash') and hash_status != 'N/A' else ts.get('esp_hash', '—')
+
+        out.append(
+            f"  ── Transform Set: {ts['name']} "
+            + "─" * max(0, 52 - len(ts['name']))
+        )
+        out.append(
+            f"  {'FIELD':<{W_NAME}} {'CURRENT':<{W_CUR}} "
+            f"{'STATUS':<{W_STS}} {'REPLACE WITH':<{W_NEW}}"
+        )
+        out.append("  " + "-" * (W_NAME + W_CUR + W_STS + W_NEW + 3))
+
+        # Encryption row
+        enc_new_str = enc_new if needs_action(enc_status) else '(no change)'
+        out.append(
+            f"  {'Encryption':<{W_NAME}} {ts['esp_enc']:<{W_CUR}} "
+            f"{_short_status(enc_status):<{W_STS}} {enc_new_str:<{W_NEW}}"
+        )
+
+        # Integrity row
+        if ts.get('esp_hash') and hash_status != 'N/A':
+            hash_new_str = hash_new if needs_action(hash_status) else '(no change)'
+            out.append(
+                f"  {'Integrity':<{W_NAME}} {ts['esp_hash']:<{W_CUR}} "
+                f"{_short_status(hash_status):<{W_STS}} {hash_new_str:<{W_NEW}}"
+            )
+
+        out.append("")
+        out.append(f"  FMC PATH: Objects → Object Management → IKEv1 IPsec Proposals")
+        out.append(f"  FIND    : {ts['name']}")
+        if needs_action(enc_status):
+            out.append(f"  CHANGE  : Encryption  {ts['esp_enc']} → {enc_new}")
+        if ts.get('esp_hash') and needs_action(hash_status):
+            out.append(
+                f"  CHANGE  : Integrity   {ts.get('esp_hash', '')} → {hash_new}"
+            )
+        out.append("")
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 3: IKEV2 PROPOSAL REMEDIATION
+# ════════════════════════════════════════════════════════════
+
+def _build_prop_remediation(ikev2_proposals):
+    out = []
+
+    affected = []
+    for prop in ikev2_proposals:
+        enc_issues = [
+            a for a in prop['encryption']
+            if needs_action(_ftd_esp_enc_status(a))
+        ]
+        int_issues = [
+            a for a in prop['integrity']
+            if needs_action(_ftd_esp_int_status(a))
+        ]
+        if enc_issues or int_issues:
+            affected.append((prop, enc_issues, int_issues))
+
+    if not affected:
+        out.append("  [OK] All IKEv2 IPsec proposals use supported algorithms.")
+        out.append("  No changes required.")
+        out.append("")
+        return out
+
+    out.append(f"  {len(affected)} IKEv2 proposal(s) require updating.\n")
+
+    for prop, enc_issues, int_issues in sorted(
+        affected, key=lambda x: x[0]['name']
+    ):
+        name = prop['name']
+        out.append(
+            f"  ── Proposal: {name} " + "─" * max(0, 58 - len(name))
+        )
+
+        if enc_issues:
+            out.append("  Encryption algorithms requiring update:")
+            for alg in enc_issues:
+                status = _ftd_esp_enc_status(alg)
+                rep    = get_esp_enc_replacement(alg) or alg
+                out.append(
+                    f"    {alg:<22} {_short_status(status):<14} → {rep}"
+                )
+
+        if int_issues:
+            out.append("  Integrity algorithms requiring update:")
+            for alg in int_issues:
+                status = _ftd_esp_int_status(alg)
+                rep    = get_esp_int_replacement(alg) or alg
+                out.append(
+                    f"    {alg:<22} {_short_status(status):<14} → {rep}"
+                )
+
+        clean_enc = [a for a in prop['encryption'] if a not in enc_issues]
+        clean_int = [a for a in prop['integrity'] if a not in int_issues]
+        if clean_enc:
+            out.append(f"  Encryption OK (no change): {', '.join(clean_enc)}")
+        if clean_int:
+            out.append(f"  Integrity OK (no change): {', '.join(clean_int)}")
+
+        out.append("")
+        out.append("  FMC PATH: Objects → Object Management → IKEv2 IPsec Proposals")
+        out.append(f"  FIND    : {name}")
+        for alg in enc_issues:
+            out.append(
+                f"  CHANGE  : Encryption  {alg} → "
+                f"{get_esp_enc_replacement(alg) or alg}"
+            )
+        for alg in int_issues:
+            out.append(
+                f"  CHANGE  : Integrity   {alg} → "
+                f"{get_esp_int_replacement(alg) or alg}"
+            )
+        out.append("")
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 4: IKEV1 PHASE 1 POLICY REMEDIATION
+# ════════════════════════════════════════════════════════════
+
+def _build_ikev1_policy_remediation(ikev1_policies):
+    out = []
+
+    affected = []
+    for pol in ikev1_policies:
+        enc_sts  = _ftd_ike_enc_status(pol.get('encryption', ''))
+        hash_sts = _ftd_ike_hash_status(pol.get('hash', ''))
+        grp_sts  = _ftd_dh_status(pol.get('group', ''))
+        if needs_action(enc_sts) or needs_action(hash_sts) or needs_action(grp_sts):
+            affected.append((pol, enc_sts, hash_sts, grp_sts))
+
+    if not affected:
+        out.append(
+            "  [OK] All IKEv1 Phase 1 policies use supported algorithms."
+        )
+        out.append("  No changes required.")
+        out.append("")
+        return out
+
+    out.append(f"  {len(affected)} IKEv1 Phase 1 policy(ies) require updating.\n")
+    out.append(
+        "  NOTE: IKEv1 Phase 1 policies are global on the ASA but are\n"
+        "  configured per-topology in FMC via IKEv1 Policy objects.\n"
+        "  Update the IKEv1 Policy objects assigned to affected topologies.\n"
+    )
+
+    W = 20
+    for pol, enc_sts, hash_sts, grp_sts in sorted(
+        affected, key=lambda x: x[0]['priority']
+    ):
+        pri  = pol['priority']
+        enc  = pol.get('encryption', '—')
+        hsh  = pol.get('hash', '—')
+        grp  = pol.get('group', '—')
+        auth = pol.get('auth', '—')
+        life = pol.get('lifetime', '—')
+
+        out.append(
+            f"  ── IKEv1 Policy Priority {pri} " + "─" * 45
+        )
+        out.append(
+            f"  {'ATTRIBUTE':<{W}} {'CURRENT':<18} {'STATUS':<14} REPLACE WITH"
+        )
+        out.append("  " + "-" * 72)
+
+        enc_new = get_ike_enc_replacement(enc) or enc
+        out.append(
+            f"  {'Encryption':<{W}} {enc:<18} "
+            f"{_short_status(enc_sts):<14} "
+            f"{enc_new if needs_action(enc_sts) else '(no change)'}"
+        )
+
+        hash_new = get_ike_hash_replacement(hsh) or hsh
+        out.append(
+            f"  {'Hash':<{W}} {hsh:<18} "
+            f"{_short_status(hash_sts):<14} "
+            f"{hash_new if needs_action(hash_sts) else '(no change)'}"
+        )
+
+        grp_new = get_dh_replacement(grp) or grp
+        out.append(
+            f"  {'DH Group':<{W}} {grp:<18} "
+            f"{_short_status(grp_sts):<14} "
+            f"{'group ' + grp_new if needs_action(grp_sts) else '(no change)'}"
+        )
+
+        out.append(f"  {'Authentication':<{W}} {auth:<18} {'OK':<14} (no change)")
+        out.append(f"  {'Lifetime (sec)':<{W}} {life:<18} {'OK':<14} (no change)")
+        out.append("")
+
+        out.append(
+            "  FMC PATH: Objects → Object Management → IKEv1 Policy\n"
+            f"  ACTION  : Find or create policy for priority {pri}.\n"
+            "            Update the following and reassign to all"
+            " affected VPN topologies:"
+        )
+        if needs_action(enc_sts):
+            out.append(f"              Encryption : {enc_new}")
+        if needs_action(hash_sts):
+            out.append(f"              Hash       : {hash_new}")
+        if needs_action(grp_sts):
+            out.append(f"              DH Group   : {grp_new}")
+        out.append("")
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 5: PER-TUNNEL ACTION TABLE
+# ════════════════════════════════════════════════════════════
+
+def _build_per_tunnel_table(
+    crypto_maps, map_interfaces,
+    ikev1_ts, ikev2_proposals,
+    affected_ts_names, affected_prop_names
+):
+    out = []
+
+    ts_lookup   = {ts['name']: ts for ts in ikev1_ts}
+    prop_lookup = {p['name']: p for p in ikev2_proposals}
+    has_affected = False
+
+    for map_name in sorted(crypto_maps.keys()):
+        seqs  = crypto_maps[map_name]
+        iface = map_interfaces.get(map_name, '(not bound)')
+
+        map_has_affected = any(
+            bool(
+                set(entry.get('ikev1_ts', [])) & affected_ts_names or
+                set(entry.get('ikev2_prop', [])) & affected_prop_names
+            )
+            for entry in seqs.values()
+        )
+        if not map_has_affected:
+            continue
+
+        has_affected = True
+        total_seqs     = len(seqs)
+        affected_count = sum(
+            1 for entry in seqs.values()
+            if set(entry.get('ikev1_ts', [])) & affected_ts_names or
+               set(entry.get('ikev2_prop', [])) & affected_prop_names
+        )
+
+        out.append(
+            f"  ── Crypto Map: {map_name}  "
+            f"(interface: {iface},  "
+            f"{affected_count}/{total_seqs} entries affected)"
+        )
+        out.append("")
+
+        for seq in sorted(seqs.keys()):
+            entry = seqs[seq]
+            peers          = entry.get('peers', [])
+            ikev1_ts_refs  = entry.get('ikev1_ts', [])
+            ikev2_prop_refs = entry.get('ikev2_prop', [])
+            match_acl      = entry.get('match_acl') or '—'
+            pfs            = entry.get('pfs') or '—'
+
+            entry_affected_ts   = [
+                t for t in ikev1_ts_refs if t in affected_ts_names
+            ]
+            entry_affected_prop = [
+                p for p in ikev2_prop_refs if p in affected_prop_names
+            ]
+
+            if not entry_affected_ts and not entry_affected_prop:
+                continue
+
+            is_blocker = any(
+                ts_lookup.get(t, {}).get('ftd_enc') == 'REMOVED' or
+                ts_lookup.get(t, {}).get('ftd_hash') == 'REMOVED'
+                for t in entry_affected_ts
+            )
+            blocker_str = (
+                " ◄ DEPLOYMENT BLOCKER" if is_blocker else " ◄ DEPRECATED"
+            )
+
+            out.append(
+                f"  SEQ {seq:>4}  Match ACL: {match_acl:<26}"
+                f"PFS: {pfs}{blocker_str}"
+            )
+
+            if peers:
+                for peer in peers:
+                    out.append(f"           Peer      : {peer}")
+            else:
+                out.append("           Peer      : (none configured)")
+
+            if entry_affected_ts:
+                out.append(
+                    "           IKEv1 Transform Sets requiring update:"
+                )
+                for ts_name in entry_affected_ts:
+                    ts       = ts_lookup.get(ts_name, {})
+                    enc      = ts.get('esp_enc', '—')
+                    hsh      = ts.get('esp_hash', '—')
+                    enc_sts  = ts.get('ftd_enc', 'UNKNOWN')
+                    hash_sts = ts.get('ftd_hash', 'UNKNOWN')
+                    enc_new  = get_esp_enc_replacement(enc) or enc
+                    hash_new = (
+                        get_esp_int_replacement(hsh) or hsh
+                    ) if hsh and hsh != '—' else hsh
+
+                    out.append(f"             {ts_name}")
+                    out.append(
+                        f"               Encryption : {enc:<18} "
+                        f"{_short_status(enc_sts)}"
+                        f"  → {enc_new if needs_action(enc_sts) else '(OK)'}"
+                    )
+                    if hsh and hsh != '—':
+                        out.append(
+                            f"               Integrity  : {hsh:<18} "
+                            f"{_short_status(hash_sts)}"
+                            f"  → {hash_new if needs_action(hash_sts) else '(OK)'}"
+                        )
+
+            if entry_affected_prop:
+                out.append(
+                    "           IKEv2 Proposals requiring update:"
+                )
+                for prop_name in entry_affected_prop:
+                    prop = prop_lookup.get(prop_name, {})
+                    out.append(f"             {prop_name}")
+                    for alg in prop.get('encryption', []):
+                        s = _ftd_esp_enc_status(alg)
+                        if needs_action(s):
+                            rep = get_esp_enc_replacement(alg) or alg
+                            out.append(
+                                f"               Encryption : {alg:<18} "
+                                f"{_short_status(s)}  → {rep}"
+                            )
+                    for alg in prop.get('integrity', []):
+                        s = _ftd_esp_int_status(alg)
+                        if needs_action(s):
+                            rep = get_esp_int_replacement(alg) or alg
+                            out.append(
+                                f"               Integrity  : {alg:<18} "
+                                f"{_short_status(s)}  → {rep}"
+                            )
+
+            out.append("")
+
+    if not has_affected:
+        out.append(
+            "  [OK] No crypto map entries reference affected algorithms."
+        )
+        out.append("  No per-tunnel changes required.")
+        out.append("")
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 6: FMC UPDATE CHECKLIST
+# ════════════════════════════════════════════════════════════
+
+def _build_fmc_checklist(
+    ikev1_ts, ikev2_proposals, ikev1_policies,
+    affected_ts_names, affected_prop_names,
+    affected_ikev1_priorities, affected_tunnel_entries
+):
+    out = []
+    step = 1
+
+    has_removed = any(
+        ts['ftd_enc'] == 'REMOVED' or ts['ftd_hash'] == 'REMOVED'
+        for ts in ikev1_ts if ts['name'] in affected_ts_names
+    ) or any(
+        any(_ftd_esp_enc_status(a) == 'REMOVED' for a in p['encryption']) or
+        any(_ftd_esp_int_status(a) == 'REMOVED' for a in p['integrity'])
+        for p in ikev2_proposals if p['name'] in affected_prop_names
+    )
+
+    out.append(
+        "  Complete these steps in order before attempting VPN deployment.\n"
+        "  Update objects first, then verify topology assignments.\n"
+    )
+
+    if affected_ts_names:
+        out.append(
+            f"  {step}. UPDATE IKEV1 IPSEC PROPOSALS (Transform Sets)\n"
+            "     Path: Objects → Object Management → IKEv1 IPsec Proposals"
+        )
+        for name in sorted(affected_ts_names):
+            ts = next((t for t in ikev1_ts if t['name'] == name), None)
+            if not ts:
+                continue
+            enc_new  = get_esp_enc_replacement(ts['esp_enc']) or ts['esp_enc']
+            hash_new = (
+                get_esp_int_replacement(ts.get('esp_hash', ''))
+                or ts.get('esp_hash', '')
+            )
+            out.append(f"       * {name}")
+            if needs_action(ts['ftd_enc']):
+                out.append(
+                    f"           Encryption : {ts['esp_enc']} → {enc_new}"
+                )
+            if ts.get('esp_hash') and needs_action(ts['ftd_hash']):
+                out.append(
+                    f"           Integrity  : {ts['esp_hash']} → {hash_new}"
+                )
+        step += 1
+        out.append("")
+
+    if affected_prop_names:
+        out.append(
+            f"  {step}. UPDATE IKEV2 IPSEC PROPOSALS\n"
+            "     Path: Objects → Object Management → IKEv2 IPsec Proposals"
+        )
+        for name in sorted(affected_prop_names):
+            out.append(
+                f"       * {name} — see Section 3 for algorithm details"
+            )
+        step += 1
+        out.append("")
+
+    if affected_ikev1_priorities:
+        out.append(
+            f"  {step}. UPDATE IKEV1 PHASE 1 POLICIES\n"
+            "     Path: Objects → Object Management → IKEv1 Policy"
+        )
+        for pri in sorted(affected_ikev1_priorities):
+            out.append(
+                f"       * Priority {pri} — see Section 4 for algorithm details"
+            )
+        step += 1
+        out.append("")
+
+    if affected_tunnel_entries:
+        out.append(
+            f"  {step}. VERIFY VPN TOPOLOGY ASSIGNMENTS\n"
+            "     Path: Devices → VPN → Site To Site\n"
+            "     Confirm each affected topology is assigned the updated\n"
+            "     proposal and policy objects. Affected peers:"
+        )
+        peers_seen = set()
+        for (map_name, entry) in affected_tunnel_entries:
+            for peer in entry.get('peers', []):
+                if peer not in peers_seen:
+                    out.append(
+                        f"       * Peer: {peer}  (map: {map_name})"
+                    )
+                    peers_seen.add(peer)
+        if not peers_seen:
+            out.append(
+                "       (no peer IPs parsed — review affected map entries)"
+            )
+        step += 1
+        out.append("")
+
+    if has_removed:
+        out.append(
+            f"  {step}. VALIDATE DEPLOYMENT\n"
+            "     a. Deploy to FTD HA pair — no crypto errors should appear\n"
+            "     b. After deployment, verify tunnels from FTD CLI:\n"
+            "          > show crypto isakmp sa\n"
+            "            IKEv1: state should show QM_IDLE or MM_ACTIVE\n"
+            "          > show crypto ipsec sa\n"
+            "            Confirm inbound/outbound SA counts incrementing\n"
+            "          > show vpn-sessiondb l2l\n"
+            "            Confirm sessions are ACTIVE\n"
+            "     c. Coordinate rekeying window with peer teams if needed\n"
+            "        — changing crypto on one side requires matching update\n"
+            "        on the remote peer before the next rekey."
+        )
+        step += 1
+        out.append("")
+
+    if step == 1:
+        out.append("  [OK] No FMC update steps required.")
+        out.append("")
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 7: UNAFFECTED TUNNELS
+# ════════════════════════════════════════════════════════════
+
+def _build_clean_tunnels(
+    crypto_maps, map_interfaces,
+    affected_ts_names, affected_prop_names
+):
+    out = []
+
+    clean_entries = []
+    for map_name in sorted(crypto_maps.keys()):
+        seqs  = crypto_maps[map_name]
+        iface = map_interfaces.get(map_name, '(not bound)')
+        for seq in sorted(seqs.keys()):
+            entry     = seqs[seq]
+            ts_refs   = set(entry.get('ikev1_ts', []))
+            prop_refs = set(entry.get('ikev2_prop', []))
+            if not (
+                ts_refs & affected_ts_names or
+                prop_refs & affected_prop_names
+            ):
+                clean_entries.append((map_name, seq, entry, iface))
+
+    if not clean_entries:
+        out.append(
+            "  All tunnel entries reference at least one affected algorithm."
+        )
+        out.append("  See Section 5 for full per-tunnel action table.")
+        out.append("")
+        return out
+
+    out.append(
+        f"  {len(clean_entries)} crypto map entry(ies) use only supported\n"
+        "  algorithms and require no crypto remediation.\n"
+        "  Confirm these deploy successfully alongside updated entries.\n"
+    )
+
+    W_MAP   = 22
+    W_SEQ   = 5
+    W_IFACE = 16
+    W_PEER  = 22
+
+    out.append(
+        f"  {'MAP':<{W_MAP}} {'SEQ':>{W_SEQ}}  {'INTERFACE':<{W_IFACE}} "
+        f"{'PEER(S)':<{W_PEER}} IKEv1 TS / IKEv2 PROP"
+    )
+    out.append("  " + "-" * 80)
+
+    for map_name, seq, entry, iface in clean_entries:
+        peers    = ', '.join(entry.get('peers', [])) or '—'
+        ts_str   = ', '.join(entry.get('ikev1_ts', []))
+        prop_str = ', '.join(entry.get('ikev2_prop', []))
+        combined = ', '.join(filter(None, [ts_str, prop_str])) or '—'
+
+        out.append(
+            f"  {map_name:<{W_MAP}} {seq:>{W_SEQ}}  {iface:<{W_IFACE}} "
+            f"{peers:<{W_PEER}} {combined}"
+        )
+
+    out.append("")
+    return out
+
+
+# ════════════════════════════════════════════════════════════
+# CORE REPORT BUILDER (public API — called by p6)
+# ════════════════════════════════════════════════════════════
+
+def build_remediation_report(results, hostname='(unknown)'):
+    """
+    Builds the full crypto remediation report from parsed results.
+
+    Args:
+        results  : dict from run_all_parsers() — requires keys:
+                   ikev1_ts, ikev2_proposals, ikev1_policies,
+                   ikev2_policies, crypto_maps, map_interfaces
+        hostname : ASA hostname string for report header
+
+    Returns:
+        Complete report as a single string.
+    """
+    out = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    ikev1_ts        = results.get('ikev1_ts', [])
+    ikev2_proposals = results.get('ikev2_proposals', [])
+    ikev1_policies  = results.get('ikev1_policies', [])
+    ikev2_policies  = results.get('ikev2_policies', [])
+    crypto_maps     = results.get('crypto_maps', {})
+    map_interfaces  = results.get('map_interfaces', {})
+
+    # ── Report header ─────────────────────────────────────────
+    out.append("=" * 78)
+    out.append("  CISCO ASA TO FTD — CRYPTO REMEDIATION REPORT")
+    out.append("=" * 78)
+    out.append("  Device      : " + hostname)
+    out.append("  Target FMC  : 7.2.8  (also valid for 7.6.x)")
+    out.append("  Report Date : " + now)
+    out.append("=" * 78)
+    out.append("")
+    out.append("  PURPOSE")
+    out.append("  " + "-" * 74)
+    out.append(
+        "  This report identifies every VPN tunnel configuration that\n"
+        "  references a REMOVED or DEPRECATED cryptographic algorithm\n"
+        "  and provides an explicit FMC-compatible replacement for each.\n"
+        "\n"
+        "  REMOVED algorithms will cause FMC deployment failures.\n"
+        "  Tunnels using these algorithms cannot be deployed until fixed.\n"
+        "\n"
+        "  DEPRECATED algorithms are currently functional on FMC 7.2.x\n"
+        "  and 7.6.x but flagged by Cisco for future removal. Update\n"
+        "  as part of this migration cleanup.\n"
+        "\n"
+        "  Use Section 5 (Per-Tunnel Action Table) as your working\n"
+        "  reference when updating VPN configurations in FMC.\n"
+        "  Use Section 6 (FMC Update Checklist) to drive the updates."
+    )
+    out.append("")
+
+    # ── Pre-compute affected sets ─────────────────────────────
+    affected_ts_names = {
+        ts['name'] for ts in ikev1_ts
+        if needs_action(ts['ftd_enc']) or
+           (needs_action(ts['ftd_hash']) and ts['ftd_hash'] != 'N/A')
+    }
+    removed_ts_names = {
+        ts['name'] for ts in ikev1_ts
+        if ts['ftd_enc'] == 'REMOVED' or ts['ftd_hash'] == 'REMOVED'
+    }
+
+    affected_prop_names = set()
+    removed_prop_names  = set()
+    for prop in ikev2_proposals:
+        enc_issues = [
+            a for a in prop['encryption']
+            if needs_action(_ftd_esp_enc_status(a))
+        ]
+        int_issues = [
+            a for a in prop['integrity']
+            if needs_action(_ftd_esp_int_status(a))
+        ]
+        if enc_issues or int_issues:
+            affected_prop_names.add(prop['name'])
+        if any(_ftd_esp_enc_status(a) == 'REMOVED' for a in prop['encryption']) or \
+           any(_ftd_esp_int_status(a) == 'REMOVED' for a in prop['integrity']):
+            removed_prop_names.add(prop['name'])
+
+    affected_ikev1_priorities = []
+    for pol in ikev1_policies:
+        enc_sts  = _ftd_ike_enc_status(pol.get('encryption', ''))
+        hash_sts = _ftd_ike_hash_status(pol.get('hash', ''))
+        grp_sts  = _ftd_dh_status(pol.get('group', ''))
+        if needs_action(enc_sts) or needs_action(hash_sts) or needs_action(grp_sts):
+            affected_ikev1_priorities.append(pol['priority'])
+
+    affected_tunnel_entries = _get_affected_tunnel_entries(
+        crypto_maps, affected_ts_names, affected_prop_names,
+        affected_ikev1_priorities
+    )
+
+    # ── Sections ──────────────────────────────────────────────
+    out.append(_section_hdr("1", "SUMMARY"))
+    out.extend(_build_summary(
+        ikev1_ts, ikev2_proposals, ikev1_policies, ikev2_policies,
+        crypto_maps, affected_ts_names, removed_ts_names,
+        affected_prop_names, removed_prop_names,
+        affected_ikev1_priorities, affected_tunnel_entries
+    ))
+
+    out.append(_section_hdr("2", "IKEV1 TRANSFORM SET REMEDIATION"))
+    out.extend(_build_ts_remediation(ikev1_ts))
+
+    out.append(_section_hdr("3", "IKEV2 IPSEC PROPOSAL REMEDIATION"))
+    out.extend(_build_prop_remediation(ikev2_proposals))
+
+    out.append(_section_hdr("4", "IKEV1 PHASE 1 POLICY REMEDIATION"))
+    out.extend(_build_ikev1_policy_remediation(ikev1_policies))
+
+    out.append(_section_hdr("5", "PER-TUNNEL ACTION TABLE"))
+    out.extend(_build_per_tunnel_table(
+        crypto_maps, map_interfaces,
+        ikev1_ts, ikev2_proposals,
+        affected_ts_names, affected_prop_names
+    ))
+
+    out.append(_section_hdr("6", "FMC UPDATE CHECKLIST"))
+    out.extend(_build_fmc_checklist(
+        ikev1_ts, ikev2_proposals, ikev1_policies,
+        affected_ts_names, affected_prop_names,
+        affected_ikev1_priorities, affected_tunnel_entries
+    ))
+
+    out.append(_section_hdr("7", "UNAFFECTED TUNNELS (NO ACTION REQUIRED)"))
+    out.extend(_build_clean_tunnels(
+        crypto_maps, map_interfaces,
+        affected_ts_names, affected_prop_names
+    ))
+
+    # ── Footer ────────────────────────────────────────────────
+    out.append("")
+    out.append("=" * 78)
+    out.append("  END OF CRYPTO REMEDIATION REPORT")
+    out.append("  Generated by ASA Migration Parser — Crypto Remediation Module")
+    out.append("  " + now)
+    out.append("=" * 78)
+
+    return "\n".join(out)
+
+
+# ════════════════════════════════════════════════════════════
+# STANDALONE MAIN
+# ════════════════════════════════════════════════════════════
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python asa_crypto_remediation.py <path_to_log_file>")
+        print("Example: python asa_crypto_remediation.py asa_logs.txt")
+        sys.exit(1)
+
+    filepath = sys.argv[1]
+
+    if not os.path.isfile(filepath):
+        print(f"[ERROR] File not found: {filepath}")
+        sys.exit(1)
+
+    if os.path.getsize(filepath) == 0:
+        print(f"[ERROR] File is empty: {filepath}")
+        sys.exit(1)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    p4_path = os.path.join(script_dir, 'asa_parser_p4.py')
+    if not os.path.isfile(p4_path):
+        print("[ERROR] asa_parser_p4.py not found in the same directory.")
+        print("        This module is required to parse the crypto section.")
+        sys.exit(1)
+
+    import asa_parser_p4 as p4
+
+    print()
+    print("=" * 60)
+    print("  ASA MIGRATION PARSER — CRYPTO REMEDIATION REPORT")
+    print("=" * 60)
+
+    print("\n  [1/3] Extracting sections from log file...")
+    sections_data = p4.extract_sections(filepath)
+    print(f"        {len(sections_data)} section(s) found")
+
+    print("  [2/3] Parsing crypto configuration...")
+    crypto_lines = sections_data.get("RUNNING-CONFIG-CRYPTO", [])
+    if not crypto_lines:
+        print("  [ERROR] RUNNING-CONFIG-CRYPTO section not found.")
+        print("          Verify your log file contains:")
+        print("          ! ===SECTION: RUNNING-CONFIG-CRYPTO===")
+        sys.exit(1)
+
+    crypto_results = p4.parse_crypto(crypto_lines)
+    (
+        ikev1_policies, ikev2_policies,
+        ikev1_ts, ikev2_proposals,
+        ipsec_profiles, dynamic_maps,
+        crypto_maps, ike_enables,
+        map_interfaces, isakmp_globals,
+        ipsec_globals, sa_settings,
+        pki_trustpoints, pki_cert_chains,
+        pki_ra_trustpoint, pki_trustpool,
+        ikev1_am_disable, partials, unmatched,
+    ) = crypto_results
+
+    results = {
+        'ikev1_policies'   : ikev1_policies,
+        'ikev2_policies'   : ikev2_policies,
+        'ikev1_ts'         : ikev1_ts,
+        'ikev2_proposals'  : ikev2_proposals,
+        'ipsec_profiles'   : ipsec_profiles,
+        'dynamic_maps'     : dynamic_maps,
+        'crypto_maps'      : crypto_maps,
+        'ike_enables'      : ike_enables,
+        'map_interfaces'   : map_interfaces,
+        'isakmp_globals'   : isakmp_globals,
+        'ipsec_globals'    : ipsec_globals,
+        'sa_settings'      : sa_settings,
+        'pki_trustpoints'  : pki_trustpoints,
+        'pki_cert_chains'  : pki_cert_chains,
+        'pki_ra_trustpoint': pki_ra_trustpoint,
+        'pki_trustpool'    : pki_trustpool,
+        'ikev1_am_disable' : ikev1_am_disable,
+        'crypto_partials'  : partials,
+        'crypto_unmatched' : unmatched,
+    }
+
+    hostname = '(unknown)'
+    for section in ['VERSION', 'RUNNING-CONFIG-ALL', 'RUNNING-CONFIG']:
+        for line in sections_data.get(section, [])[:50]:
+            m = re.match(r'^hostname\s+(\S+)', line.strip(), re.IGNORECASE)
+            if m:
+                hostname = m.group(1)
+                break
+        if hostname != '(unknown)':
+            break
+
+    print(f"        Transform sets  : {len(ikev1_ts)}")
+    print(f"        IKEv2 proposals : {len(ikev2_proposals)}")
+    print(f"        IKEv1 policies  : {len(ikev1_policies)}")
+    print(f"        Crypto map entries: {sum(len(v) for v in crypto_maps.values())}")
+
+    print("  [3/3] Building remediation report...")
+    report = build_remediation_report(results, hostname)
+
+    log_dir  = os.path.dirname(os.path.abspath(filepath))
+    out_path = os.path.join(log_dir, "asa_migration_crypto_remediation.txt")
+
+    with open(out_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+
+    print(f"        Output : {out_path}")
+    print()
+    print("=" * 60)
+    print("  COMPLETE")
+    print("=" * 60)
+    print()
+    print("  Review Section 1 for summary counts.")
+    print("  Use Section 5 as your per-tunnel working reference.")
+    print("  Follow Section 6 checklist when updating FMC.")
+    print()
+
+
+if __name__ == "__main__":
+    main()
